@@ -165,14 +165,13 @@ Cobertura mínima exigida: parser XML, evaluador de alertas, mapping a OTel attr
 - **Slack:** `#aoa-observability`
 - **Issues:** vía Jira proyecto `OBS`
 
-# Puerto 22 - SSH (ya sabemos que abre, confirmemos limpio)
-timeout 3 bash -c '</dev/tcp/10.121.114.32/22' && echo "✅ 22 ABIERTO" || echo "❌ 22 CERRADO"
-
-# Puerto 12443 - REST API del HMC (el más importante)
-timeout 3 bash -c '</dev/tcp/10.121.114.32/12443' && echo "✅ 12443 ABIERTO" || echo "❌ 12443 CERRADO"
-
-# Puerto 443 - GUI web
-timeout 3 bash -c '</dev/tcp/10.121.114.32/443' && echo "✅ 443 ABIERTO" || echo "❌ 443 CERRADO"
-
-# Puerto 9090 - puerto alterno HMC
-timeout 3 bash -c '</dev/tcp/10.121.114.32/9090' && echo "✅ 9090 ABIERTO" || echo "❌ 9090 CERRADO"
+                                                                             *
+* Este es un equipo de uso Privado. Su ingreso solo es permitido para usuarios*
+* autorizados. La utilizacion por usuarios no autorizados esta prohibida.     *
+* El uso no autorizado o impropio de este sistema puede causar sanciones      *
+* disciplinarias y acciones civiles y penales.                                *
+* Accesando a este sistema el usuario esta de acuerdo y acepta estos terminos *
+* condiciones. Si usted no es un usuario autorizado o no esta de acuerdo con  *
+* las condiciones listadas termine su uso inmediatamente.                     *
+*                                                                             *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
