@@ -166,12 +166,24 @@ Cobertura mínima exigida: parser XML, evaluador de alertas, mapping a OTel attr
 - **Issues:** vía Jira proyecto `OBS`
 
                                                                              *
-* Este es un equipo de uso Privado. Su ingreso solo es permitido para usuarios*
-* autorizados. La utilizacion por usuarios no autorizados esta prohibida.     *
-* El uso no autorizado o impropio de este sistema puede causar sanciones      *
-* disciplinarias y acciones civiles y penales.                                *
-* Accesando a este sistema el usuario esta de acuerdo y acepta estos terminos *
-* condiciones. Si usted no es un usuario autorizado o no esta de acuerdo con  *
-* las condiciones listadas termine su uso inmediatamente.                     *
-*                                                                             *
-* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+Hola, confirmado que 10.121.114.32 es una LPAR AIX. Para integrarla al colector AOA necesito:
+
+1. Usuario read-only en AIX (sugerencia: aoa_reader)
+2. Que pueda ejecutar:
+   - lparstat -X 1 1
+   - errpt -a
+3. Autenticación por clave pública SSH (envío la public key del agente)
+4. Confirmar nombre lógico/hostname de la LPAR
+5. ¿Hay más LPARs AIX que debamos monitorear? (necesito IPs)
+6. ¿Existe una HMC que administre estas LPARs? Si sí, ¿IP y puede habilitar API REST en 12443?
+🤔 ¿Y el conector HMC del que hablamos antes?
+Te recomiendo diferirlo por ahora, porque:
+
+✅ Tu caso actual NO tiene HMC accesible
+✅ El array estático aix.lpars[] ya cubre tu necesidad inmediata
+🔄 Cuando Infra responda el punto 6, sabremos si vale la pena implementarlo
+Si más adelante descubres que sí hay una HMC y te dan acceso, retomamos el diseño del HmcSshClient / HmcClient REST que ya tenemos planeado.
+
+🚀 Próximos pasos sugeridos
+¿Quieres que validemos primero la conexión SSH a 10.121.114.32 con el agente actual? (sin tocar código todavía)
+¿O prefieres que dejemos preparado el código del conector HMC opcional anticipadamente, para cuando Infra confirme si existe HMC?
