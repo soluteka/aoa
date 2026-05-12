@@ -165,16 +165,14 @@ Cobertura mínima exigida: parser XML, evaluador de alertas, mapping a OTel attr
 - **Slack:** `#aoa-observability`
 - **Issues:** vía Jira proyecto `OBS`
 
-## Comandos SSH HMC Hipervisor
+# Puerto 22 - SSH (ya sabemos que abre, confirmemos limpio)
+timeout 3 bash -c '</dev/tcp/10.121.114.32/22' && echo "✅ 22 ABIERTO" || echo "❌ 22 CERRADO"
 
-grivas@PSTBOCC-7164:~$ timeout 3 bash -c
-bash: -c: option requires an argument
-grivas@PSTBOCC-7164:~$ timeout 3 bash -c '</dev/tcp/10.121.114.32' && echo "SSH CERRADO"
-bash: line 1: /dev/tcp/10.121.114.32: No such file or directory
-grivas@PSTBOCC-7164:~$ timeout 3 bash -c '</dev/tcp/10.121.114.32/22' && echo "SSH CERRADO"
-SSH CERRADO
-grivas@PSTBOCC-7164:~$ curl -k -i --max-time 5 https://10-121-114-32/
-curl: (28) Resolving timed out after 5000 milliseconds
-grivas@PSTBOCC-7164:~$ curl -k -i --max-time 5 https://10.121.114.32/
-curl: (28) Connection timed out after 5002 milliseconds
-grivas@PSTBOCC-7164:~$
+# Puerto 12443 - REST API del HMC (el más importante)
+timeout 3 bash -c '</dev/tcp/10.121.114.32/12443' && echo "✅ 12443 ABIERTO" || echo "❌ 12443 CERRADO"
+
+# Puerto 443 - GUI web
+timeout 3 bash -c '</dev/tcp/10.121.114.32/443' && echo "✅ 443 ABIERTO" || echo "❌ 443 CERRADO"
+
+# Puerto 9090 - puerto alterno HMC
+timeout 3 bash -c '</dev/tcp/10.121.114.32/9090' && echo "✅ 9090 ABIERTO" || echo "❌ 9090 CERRADO"
