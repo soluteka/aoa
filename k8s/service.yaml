@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: aoa-aix-logs-agent
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: aoa-aix-logs-agent
+    app.kubernetes.io/component: agent
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: aoa-aix-logs-agent
+  ports:
+    - name: health
+      port: 8081
+      targetPort: health
+      protocol: TCP
+    - name: syslog-udp
+      port: 5140
+      targetPort: syslog-udp
+      protocol: UDP
+    - name: syslog-tcp
+      port: 5141
+      targetPort: syslog-tcp
+      protocol: TCP

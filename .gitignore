@@ -1,0 +1,36 @@
+﻿# Build
+target/
+*.class
+*.jar
+!**/mvnw.jar
+
+# Logs
+*.log
+otel-logs/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secretos
+**/id_rsa
+**/id_ed25519
+**/*.key
+**/*.pem
+.env
+.env.*
+!.env.example
+application-local.yml
+application-local.yaml
+
+# Docker
+otel-logs/

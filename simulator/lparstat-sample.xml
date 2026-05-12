@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lparstat>
+  <cpu>
+    <user>23.5</user>
+    <sys>11.2</sys>
+    <idle>65.3</idle>
+  </cpu>
+  <lpar>
+    <entitled>2.0</entitled>
+    <physicalUsed>1.4</physicalUsed>
+  </lpar>
+  <memory>
+    <pagingUsedPct>87.2</pagingUsedPct>
+    <pagingRate>15.6</pagingRate>
+  </memory>
+</lparstat>

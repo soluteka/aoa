@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aoa-aix-logs-agent
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: aoa-aix-logs-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: aoa-observability
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aoa-aix-logs-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aoa-aix-logs-agent
+        app.kubernetes.io/component: agent
+      annotations:
+        checksum/config: "REEMPLAZAR_POR_HASH_DEL_CONFIGMAP"
+    spec:
+      serviceAccountName: default
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/<org>/aoa-aix-logs-agent:1.0.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+            - name: syslog-udp
+              containerPort: 5140
+              protocol: UDP
+            - name: syslog-tcp
+              containerPort: 5141
+              protocol: TCP
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "prod,ssh"
+            - name: DEPLOYMENT_ENV
+              value: "prod"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability.svc.cluster.local:4317"
+            - name: AIX_SSH_USER
+              valueFrom:
+                secretKeyRef:
+                  name: aoa-aix-logs-agent-ssh
+                  key: ssh-user
+            - name: JAVA_OPTS
+              value: "-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /actuator/health
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: ssh-keys
+              mountPath: /etc/aoa/keys
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: aoa-aix-logs-agent-config
+            items:
+              - key: application.yml
+                path: application.yml
+        - name: ssh-keys
+          secret:
+            secretName: aoa-aix-logs-agent-ssh
+            defaultMode: 0400
+            items:
+              - key: id_rsa
+                path: id_rsa
+              - key: known_hosts
+                path: known_hosts
+        - name: tmp
+          emptyDir: {}

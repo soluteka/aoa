@@ -1,0 +1,8 @@
+aix:
+  ssh:
+    host: ${AIX_SSH_HOST:aix-mock}
+    port: ${AIX_SSH_PORT:22}
+    user: ${AIX_SSH_USER:aixmock}
+    private-key-path: ${AIX_SSH_PRIVATE_KEY_PATH:/app/keys/aoa_aix_mock}
+    command: "lparstat -X"
+    connect-timeout-ms: 5000

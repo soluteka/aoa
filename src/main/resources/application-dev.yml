@@ -1,0 +1,35 @@
+# ============================================================
+# Perfil DEV — desarrollo local SIN Docker, SIN AIX, SIN SSH
+# Lee el XML de muestra desde classpath y emite OTLP a localhost.
+# ============================================================
+
+aix:
+  syslog:
+    udp-port: 5140
+    tcp-port: 5141
+  lparstat:
+    sample-file: classpath:samples/lparstat-sample.xml
+    interval-ms: 10000
+  memory:
+    interval-ms: 20000
+  lpars:
+    - name: aix-mock-1
+      host: aix-mock
+      ssh-user: aixmock
+      ssh-key: /app/keys/aoa_aix_mock
+      environment: dev
+      frame: mock-frame
+
+otel:
+  exporter:
+    otlp:
+      endpoint: http://localhost:4317
+      protocol: grpc
+
+logging:
+  level:
+    com.aoa.aix: DEBUG
+    root: INFO
+
+server:
+  port: 8081

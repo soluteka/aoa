@@ -1,0 +1,54 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aoa-aix-logs-agent
+  namespace: observability
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aoa-aix-logs-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Permitir syslog desde subredes AIX (ajustar CIDR)
+    - from:
+        - ipBlock:
+            cidr: 10.10.20.0/24
+      ports:
+        - protocol: UDP
+          port: 5140
+        - protocol: TCP
+          port: 5141
+    # Permitir health checks desde kubelet/Prometheus dentro del cluster
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: observability
+      ports:
+        - protocol: TCP
+          port: 8081
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # SSH a LPARs AIX
+    - to:
+        - ipBlock:
+            cidr: 10.10.20.0/24
+      ports:
+        - protocol: TCP
+          port: 22
+    # OTLP/gRPC al Collector corporativo
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317

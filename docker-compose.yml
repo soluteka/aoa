@@ -1,0 +1,51 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./otel-logs:/var/log/otel
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    networks:
+      - aoa-net
+
+  aix-mock:
+    build:
+      context: ./aix-mock
+      dockerfile: Dockerfile
+    container_name: aix-mock
+    ports:
+      - "2222:22"     # SSH expuesto en localhost:2222
+    networks:
+      - aoa-net
+
+  aoa-logs-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aoa-logs-agent
+    depends_on:
+      - otel-collector
+      - aix-mock
+
+    environment:
+      SPRING_PROFILES_ACTIVE: dev,ssh
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317   
+      AIX_SSH_HOST: aix-mock
+      AIX_SSH_PORT: "22"
+      AIX_SSH_USER: aixmock
+      AIX_SSH_PRIVATE_KEY_PATH: /app/keys/aoa_aix_mock
+    volumes:
+      - ./aix-mock/keys:/app/keys:ro
+    ports:
+      - "1514:1514/udp"
+      - "1514:1514/tcp"
+    networks:
+      - aoa-net
+
+networks:
+  aoa-net:
+    driver: bridge

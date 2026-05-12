@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: observability
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.example.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml
+
+commonLabels:
+  app.kubernetes.io/name: aoa-aix-logs-agent
+  app.kubernetes.io/part-of: aoa-observability
+
+images:
+  - name: ghcr.io/<org>/aoa-aix-logs-agent
+    newTag: "1.0.0"

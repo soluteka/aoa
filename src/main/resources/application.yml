@@ -1,0 +1,89 @@
+# ============================================================
+# AOA-AIX Logs Agent — Configuración base
+# ============================================================
+# Las propiedades específicas de ambiente viven en:
+#   - application-dev.yml   (desarrollo local)
+#   - application-prod.yml  (producción)
+# El perfil activo se selecciona vía variable de entorno:
+#   SPRING_PROFILES_ACTIVE=dev | prod
+# ============================================================
+
+spring:
+  application:
+    name: aoa-aix-logs-agent
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+
+server:
+  port: 8080   # endpoint de salud/management del agente
+
+# ------------------------------------------------------------
+# Configuración del agente AIX (consumida por AixProperties)
+# ------------------------------------------------------------
+aix:
+  lpars:
+    - name: aix-mock-1
+      host: aix-mock
+      ssh-user: aixmock
+      ssh-key: /app/keys/aoa_aix_mock
+      environment: dev
+      frame: mock-frame
+  ssh:
+    host: ${AIX_SSH_HOST:aix-mock}
+    port: ${AIX_SSH_PORT:22}
+    user: ${AIX_SSH_USER:aixmock}
+    private-key-path: ${AIX_SSH_PRIVATE_KEY_PATH:/app/keys/aoa_aix_mock}
+    command: "lparstat -X"
+    connect-timeout-ms: 5000
+    read-timeout-ms: 10000
+    skip-host-key-verification: true
+  # Intervalo de muestreo de lparstat -X (ms).
+  lparstat:
+    interval-ms: 30000
+
+  # Intervalo de evaluación de alertas predictivas de memoria (ms).
+  memory:
+    interval-ms: 60000
+
+  sampler:
+    interval-ms: 30000    # muestreo cada 30s
+    max-parallel: 8       # máximo de LPARs en paralelo por tick
+    
+  # La lista 'aix.lpars' se define en cada perfil (dev/prod).
+
+# ------------------------------------------------------------
+# OpenTelemetry — el endpoint real vive en cada perfil
+# ------------------------------------------------------------
+otel:
+  service:
+    name: aoa-aix-logs-agent
+
+  exporter:
+    otlp:
+      # endpoint se define por perfil (dev/prod)
+      protocol: grpc          # grpc | http/protobuf
+      timeout-ms: 10000
+      compression: gzip       # gzip | none
+      headers: ""             # formato: "k1=v1,k2=v2"
+
+  retry:
+    enabled: true
+    max-attempts: 5
+    initial-backoff-ms: 1000
+    max-backoff-ms: 30000
+    backoff-multiplier: 2.0
+
+  buffer:
+    max-queue-size: 10000
+    schedule-delay-ms: 5000
+    export-timeout-ms: 30000
+    max-export-batch-size: 512
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+logging:
+  level:
+    root: INFO
+    com.aoa.aix: DEBUG
+    org.springframework.integration: INFO

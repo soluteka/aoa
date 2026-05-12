@@ -1,0 +1,365 @@
+name: CI/CD — AOA AIX Logs Agent
+
+on:
+  push:
+    branches: [main, develop, 'release/**']
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: 'Forzar push de imagen Docker'
+        required: false
+        default: 'false'
+
+env:
+  JAVA_VERSION: '21'
+  JAVA_DISTRIBUTION: 'temurin'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  MAVEN_OPTS: '-Xmx2g -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn'
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  id-token: write
+
+jobs:
+  # ============================================================
+  # 1. BUILD + UNIT TESTS
+  # ============================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: Resolver versión del proyecto
+        id: version
+        run: |
+          VERSION=$(./mvnw -q -DforceStdout help:evaluate -Dexpression=project.version)
+          echo "value=$VERSION" >> $GITHUB_OUTPUT
+          echo "📦 Versión: $VERSION"
+
+      - name: Compilar
+        run: ./mvnw -B -ntp clean compile
+
+      - name: Tests unitarios
+        run: ./mvnw -B -ntp test
+
+      - name: Publicar reporte de tests
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: JUnit
+          path: '**/target/surefire-reports/*.xml'
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Cobertura JaCoCo
+        run: ./mvnw -B -ntp jacoco:report
+
+      - name: Subir cobertura a artefactos
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/site/jacoco/
+          retention-days: 7
+
+      - name: Empaquetar JAR
+        run: ./mvnw -B -ntp package -DskipTests
+
+      - name: Subir JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/aoa-aix-logs-agent-*.jar
+          retention-days: 14
+
+  # ============================================================
+  # 2. CALIDAD DE CÓDIGO
+  # ============================================================
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: SpotBugs
+        run: ./mvnw -B -ntp spotbugs:check
+        continue-on-error: true
+
+      - name: Checkstyle
+        run: ./mvnw -B -ntp checkstyle:check
+        continue-on-error: true
+
+      - name: SonarQube Scan
+        if: ${{ env.SONAR_TOKEN != '' }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          ./mvnw -B -ntp verify sonar:sonar \
+            -Dsonar.projectKey=aoa-aix-logs-agent \
+            -Dsonar.host.url=$SONAR_HOST_URL \
+            -Dsonar.login=$SONAR_TOKEN
+
+  # ============================================================
+  # 3. SEGURIDAD — SCA + SAST + SECRETS
+  # ============================================================
+  security:
+    name: Security Scans
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: OWASP Dependency-Check
+        run: ./mvnw -B -ntp org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=8
+        continue-on-error: true
+
+      - name: Subir reporte OWASP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-report
+          path: target/dependency-check-report.html
+          retention-days: 30
+
+      - name: Trivy — Filesystem scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: '.'
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Subir Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Gitleaks — Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # 4. DOCKER BUILD + SCAN + PUSH
+  # ============================================================
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: [build, quality, security]
+    timeout-minutes: 20
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/tags/v') ||
+       startsWith(github.ref, 'refs/heads/release/'))
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Descargar JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login a GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata de imagen
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=aoa-aix-logs-agent
+            org.opencontainers.image.description=AIX telemetry ingestion agent (lparstat + errpt) → OTLP
+            org.opencontainers.image.vendor=AOA Observability
+            org.opencontainers.image.version=${{ needs.build.outputs.version }}
+
+      - name: Build & Push imagen
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Trivy — Image scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: Subir Trivy image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Cosign — Firmar imagen (keyless)
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "$TAGS" | xargs -I{} cosign sign --yes {}@${DIGEST}
+
+  # ============================================================
+  # 5. RELEASE (solo en tags vX.Y.Z)
+  # ============================================================
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Descargar JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: ./artifacts
+
+      - name: Generar changelog
+        id: changelog
+        uses: mikepenz/release-changelog-builder-action@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          configuration: |
+            {
+              "categories": [
+                {"title": "## 🚀 Features", "labels": ["feature","enhancement"]},
+                {"title": "## 🐛 Fixes", "labels": ["bug","fix"]},
+                {"title": "## 🔒 Security", "labels": ["security"]},
+                {"title": "## 📚 Docs", "labels": ["docs"]},
+                {"title": "## 🧰 Chore", "labels": ["chore","ci","build"]}
+              ]
+            }
+
+      - name: Crear Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## AOA AIX Logs Agent ${{ github.ref_name }}
+
+            **Imagen Docker:** `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}`
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ---
+            📖 [Contrato OTLP](docs/otlp-contract.md) · [Arquitectura](docs/architecture.md)
+          files: |
+            ./artifacts/*.jar
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          generate_release_notes: false
+
+  # ============================================================
+  # 6. NOTIFICACIÓN
+  # ============================================================
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [build, quality, security, docker]
+    if: always() && github.event_name == 'push'
+
+    steps:
+      - name: Resumen en Job Summary
+        run: |
+          {
+            echo "## 📦 Pipeline summary"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Build & Test | ${{ needs.build.result }} |"
+            echo "| Quality      | ${{ needs.quality.result }} |"
+            echo "| Security     | ${{ needs.security.result }} |"
+            echo "| Docker       | ${{ needs.docker.result }} |"
+            echo ""
+            echo "**Version:** \`${{ needs.build.outputs.version }}\`"
+            echo "**Commit:** \`${{ github.sha }}\`"
+          } >> $GITHUB_STEP_SUMMARY
