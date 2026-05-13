@@ -1,0 +1,29 @@
+📧 Correo modelo para Infra
+Asunto: Solicitud de acceso SSH read-only a LPAR AIX 10.121.114.32 — Proyecto AOA Logs Agent
+
+Hola equipo,
+
+Estamos implementando el AOA AIX Logs Agent, un colector de métricas y eventos que se conecta vía SSH a las LPARs AIX para ejecutar lparstat y errpt (ambos read-only). Para validar el flujo necesitamos acceso a la LPAR 10.121.114.32.
+
+Solicitudes:
+
+Crear usuario read-only en la LPAR. Sugerencia de nombre: aoa_reader.
+Sin permisos de root.
+Sin permisos de escritura.
+Shell: /usr/bin/ksh o similar.
+Grupo: staff (requerido para leer errpt).
+Autenticación por clave pública SSH (no password). Adjunto la public key:
+ssh-ed25519 AAAAC3NzaC1lZD... aoa-logs-agent
+Debe cargarse en ~aoa_reader/.ssh/authorized_keys con permisos 600.
+Comandos requeridos (ambos read-only):
+lparstat -X 1 1
+errpt -a
+Firewall: permitir SSH (TCP/22) entrante desde nuestra IP/segmento de red del agente: <IP_O_SUBNET_DEL_AGENTE>.
+Confirmación de inventario:
+¿Hay más LPARs AIX que debamos monitorear? Si sí, lista de IPs/hostnames.
+¿Existe una HMC que administre estas LPARs? Si sí, IP y si puede exponer su REST API en puerto 12443.
+¿Tienen política de rotación de claves SSH? ¿Cada cuánto?
+Contacto on-call del equipo AIX para troubleshooting durante la integración.
+Quedo atento.
+Saludos,
+[tu nombre]

@@ -1,0 +1,2389 @@
+﻿===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\.github\workflows\ci.yml =====
+name: CI/CD â€” AOA AIX Logs Agent
+
+on:
+  push:
+    branches: [main, develop, 'release/**']
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: 'Forzar push de imagen Docker'
+        required: false
+        default: 'false'
+
+env:
+  JAVA_VERSION: '21'
+  JAVA_DISTRIBUTION: 'temurin'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  MAVEN_OPTS: '-Xmx2g -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn'
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  id-token: write
+
+jobs:
+  # ============================================================
+  # 1. BUILD + UNIT TESTS
+  # ============================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: Resolver versiÃ³n del proyecto
+        id: version
+        run: |
+          VERSION=$(./mvnw -q -DforceStdout help:evaluate -Dexpression=project.version)
+          echo "value=$VERSION" >> $GITHUB_OUTPUT
+          echo "ðŸ“¦ VersiÃ³n: $VERSION"
+
+      - name: Compilar
+        run: ./mvnw -B -ntp clean compile
+
+      - name: Tests unitarios
+        run: ./mvnw -B -ntp test
+
+      - name: Publicar reporte de tests
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: JUnit
+          path: '**/target/surefire-reports/*.xml'
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Cobertura JaCoCo
+        run: ./mvnw -B -ntp jacoco:report
+
+      - name: Subir cobertura a artefactos
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/site/jacoco/
+          retention-days: 7
+
+      - name: Empaquetar JAR
+        run: ./mvnw -B -ntp package -DskipTests
+
+      - name: Subir JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/aoa-aix-logs-agent-*.jar
+          retention-days: 14
+
+  # ============================================================
+  # 2. CALIDAD DE CÃ“DIGO
+  # ============================================================
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: SpotBugs
+        run: ./mvnw -B -ntp spotbugs:check
+        continue-on-error: true
+
+      - name: Checkstyle
+        run: ./mvnw -B -ntp checkstyle:check
+        continue-on-error: true
+
+      - name: SonarQube Scan
+        if: ${{ env.SONAR_TOKEN != '' }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          ./mvnw -B -ntp verify sonar:sonar \
+            -Dsonar.projectKey=aoa-aix-logs-agent \
+            -Dsonar.host.url=$SONAR_HOST_URL \
+            -Dsonar.login=$SONAR_TOKEN
+
+  # ============================================================
+  # 3. SEGURIDAD â€” SCA + SAST + SECRETS
+  # ============================================================
+  security:
+    name: Security Scans
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: OWASP Dependency-Check
+        run: ./mvnw -B -ntp org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=8
+        continue-on-error: true
+
+      - name: Subir reporte OWASP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-report
+          path: target/dependency-check-report.html
+          retention-days: 30
+
+      - name: Trivy â€” Filesystem scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: '.'
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Subir Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Gitleaks â€” Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # 4. DOCKER BUILD + SCAN + PUSH
+  # ============================================================
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: [build, quality, security]
+    timeout-minutes: 20
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/tags/v') ||
+       startsWith(github.ref, 'refs/heads/release/'))
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Descargar JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login a GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata de imagen
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=aoa-aix-logs-agent
+            org.opencontainers.image.description=AIX telemetry ingestion agent (lparstat + errpt) â†’ OTLP
+            org.opencontainers.image.vendor=AOA Observability
+            org.opencontainers.image.version=${{ needs.build.outputs.version }}
+
+      - name: Build & Push imagen
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Trivy â€” Image scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: Subir Trivy image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Cosign â€” Firmar imagen (keyless)
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "$TAGS" | xargs -I{} cosign sign --yes {}@${DIGEST}
+
+  # ============================================================
+  # 5. RELEASE (solo en tags vX.Y.Z)
+  # ============================================================
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Descargar JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: ./artifacts
+
+      - name: Generar changelog
+        id: changelog
+        uses: mikepenz/release-changelog-builder-action@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          configuration: |
+            {
+              "categories": [
+                {"title": "## ðŸš€ Features", "labels": ["feature","enhancement"]},
+                {"title": "## ðŸ› Fixes", "labels": ["bug","fix"]},
+                {"title": "## ðŸ”’ Security", "labels": ["security"]},
+                {"title": "## ðŸ“š Docs", "labels": ["docs"]},
+                {"title": "## ðŸ§° Chore", "labels": ["chore","ci","build"]}
+              ]
+            }
+
+      - name: Crear Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## AOA AIX Logs Agent ${{ github.ref_name }}
+
+            **Imagen Docker:** `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}`
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ---
+            ðŸ“– [Contrato OTLP](docs/otlp-contract.md) Â· [Arquitectura](docs/architecture.md)
+          files: |
+            ./artifacts/*.jar
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          generate_release_notes: false
+
+  # ============================================================
+  # 6. NOTIFICACIÃ“N
+  # ============================================================
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [build, quality, security, docker]
+    if: always() && github.event_name == 'push'
+
+    steps:
+      - name: Resumen en Job Summary
+        run: |
+          {
+            echo "## ðŸ“¦ Pipeline summary"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Build & Test | ${{ needs.build.result }} |"
+            echo "| Quality      | ${{ needs.quality.result }} |"
+            echo "| Security     | ${{ needs.security.result }} |"
+            echo "| Docker       | ${{ needs.docker.result }} |"
+            echo ""
+            echo "**Version:** \`${{ needs.build.outputs.version }}\`"
+            echo "**Commit:** \`${{ github.sha }}\`"
+          } >> $GITHUB_STEP_SUMMARY
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\.mvn\wrapper\maven-wrapper.properties =====
+wrapperVersion=3.3.4
+distributionType=only-script
+distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.15/apache-maven-3.9.15-bin.zip
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\simulator\lparstat-sample-critical.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<lparstat>
+  <cpu><user>70.0</user><sys>20.0</sys><idle>10.0</idle></cpu>
+  <lpar><entitled>2.0</entitled><physicalUsed>1.95</physicalUsed></lpar>
+  <memory><pagingUsedPct>92.5</pagingUsedPct><pagingRate>25.3</pagingRate></memory>
+</lparstat>
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\simulator\lparstat-sample-normal.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<lparstat>
+  <cpu><user>15.0</user><sys>5.0</sys><idle>80.0</idle></cpu>
+  <lpar><entitled>2.0</entitled><physicalUsed>0.6</physicalUsed></lpar>
+  <memory><pagingUsedPct>35.0</pagingUsedPct><pagingRate>0.2</pagingRate></memory>
+</lparstat>
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\simulator\lparstat-sample-warning.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<lparstat>
+  <cpu><user>40.0</user><sys>15.0</sys><idle>45.0</idle></cpu>
+  <lpar><entitled>2.0</entitled><physicalUsed>1.1</physicalUsed></lpar>
+  <memory><pagingUsedPct>75.0</pagingUsedPct><pagingRate>6.0</pagingRate></memory>
+</lparstat>
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\simulator\lparstat-sample.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<lparstat>
+  <cpu>
+    <user>23.5</user>
+    <sys>11.2</sys>
+    <idle>65.3</idle>
+  </cpu>
+  <lpar>
+    <entitled>2.0</entitled>
+    <physicalUsed>1.4</physicalUsed>
+  </lpar>
+  <memory>
+    <pagingUsedPct>87.2</pagingUsedPct>
+    <pagingRate>15.6</pagingRate>
+  </memory>
+</lparstat>
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\application\port\in\IngestErrptUseCase.java =====
+package com.aoa.aix.application.port.in;
+
+public interface IngestErrptUseCase {
+    void ingest(String rawSyslogPayload, String sourceHost);
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\application\port\in\IngestLparstatUseCase.java =====
+package com.aoa.aix.application.port.in;
+
+public interface IngestLparstatUseCase {
+    void collectAndIngest();
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\application\port\out\LparstatCommandExecutor.java =====
+package com.aoa.aix.application.port.out;
+
+import com.aoa.aix.domain.model.LparstatSnapshot;
+import java.util.List;
+
+/**
+ * Puerto de salida para obtener snapshots de lparstat.
+ *
+ * Devuelve una LISTA porque puede haber N LPARs configuradas
+ * (caso SSH multi-host). Implementaciones single-host devuelven
+ * una lista de 1 elemento.
+ */
+public interface LparstatCommandExecutor {
+    List<LparstatSnapshot> executeAll();
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\application\port\out\LparstatExecutionException.java =====
+package com.aoa.aix.application.port.out;
+
+/**
+ * ExcepciÃ³n especÃ­fica para fallas al ejecutar lparstat remotamente.
+ *
+ * Separar este tipo de error permite que el caso de uso decida la polÃ­tica:
+ *   - Loguear como warn y continuar con la siguiente LPAR.
+ *   - Emitir una mÃ©trica/log OTLP de "host unreachable".
+ *   - No tumbar el ciclo de muestreo completo por un fallo puntual.
+ */
+public class LparstatExecutionException extends Exception {
+
+    public LparstatExecutionException(String message, Throwable cause) {
+        super(message, cause);
+    }
+
+    public LparstatExecutionException(String message) {
+        super(message);
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\application\port\out\OtlpLogPublisher.java =====
+package com.aoa.aix.application.port.out;
+
+import com.aoa.aix.domain.model.RawAixEvent;
+
+public interface OtlpLogPublisher {
+    void publish(RawAixEvent event);
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\application\port\out\OtlpMetricPublisher.java =====
+package com.aoa.aix.application.port.out;
+
+import com.aoa.aix.domain.model.LparstatSnapshot;
+import com.aoa.aix.domain.model.MemoryAlert;
+
+public interface OtlpMetricPublisher {
+    void publishSnapshot(LparstatSnapshot snapshot);
+    void publishAlert(MemoryAlert alert);
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\application\service\ErrptIngestService.java =====
+package com.aoa.aix.application.service;
+
+import com.aoa.aix.application.port.in.IngestErrptUseCase;
+import com.aoa.aix.application.port.out.OtlpLogPublisher;
+import com.aoa.aix.domain.model.ErrptEvent;
+import com.aoa.aix.domain.model.RawAixEvent;
+import com.aoa.aix.domain.model.Severity;
+import com.aoa.aix.domain.service.AixErrorClassifier;
+import com.aoa.aix.infrastructure.outbound.parser.ErrptParser;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@RequiredArgsConstructor
+public class ErrptIngestService implements IngestErrptUseCase {
+
+    private final ErrptParser parser;
+    private final AixErrorClassifier classifier;
+    private final OtlpLogPublisher publisher;
+
+    @Override
+    public void ingest(String rawSyslogPayload, String sourceHost) {
+        ErrptEvent event = parser.parse(rawSyslogPayload, sourceHost);
+        if (event == null) return;
+
+        Severity sev = classifier.classify(event);
+
+        Map<String, String> attrs = new HashMap<>();
+        attrs.put("errpt.id",       safe(event.getIdentifier()));
+        attrs.put("errpt.class",    safe(event.getErrorClass()));
+        attrs.put("errpt.type",     safe(event.getErrorType()));
+        attrs.put("errpt.resource", safe(event.getResourceName()));
+
+        RawAixEvent raw = RawAixEvent.builder()
+            .timestamp(event.getTimestamp())
+            .host(event.getHost())
+            .source("errpt")
+            .message(event.getDescription())
+            .severity(sev)
+            .attributes(attrs)
+            .build();
+
+        log.debug("Publishing errpt event: {}", raw);
+        publisher.publish(raw);
+    }
+
+    private String safe(String s) { return s == null ? "" : s; }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\application\service\LparstatIngestService.java =====
+package com.aoa.aix.application.service;
+
+import com.aoa.aix.application.port.in.IngestLparstatUseCase;
+import com.aoa.aix.application.port.out.LparstatCommandExecutor;
+import com.aoa.aix.application.port.out.OtlpMetricPublisher;
+import com.aoa.aix.domain.model.LparstatSnapshot;
+import com.aoa.aix.domain.service.MemoryAlertEvaluator;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.List;
+
+@Slf4j
+@RequiredArgsConstructor
+public class LparstatIngestService implements IngestLparstatUseCase {
+
+    private final LparstatCommandExecutor executor;
+    private final MemoryAlertEvaluator evaluator;
+    private final OtlpMetricPublisher publisher;
+
+    @Override
+    public void collectAndIngest() {
+        List<LparstatSnapshot> snapshots = executor.executeAll();
+        if (snapshots == null || snapshots.isEmpty()) {
+            log.warn("lparstat returned no snapshots");
+            return;
+        }
+        for (LparstatSnapshot snap : snapshots) {
+            try {
+                publisher.publishSnapshot(snap);
+                evaluator.evaluate(snap).forEach(publisher::publishAlert);
+            } catch (Exception e) {
+                log.warn("[{}] Error publicando snapshot: {}", snap.getLparName(), e.getMessage());
+            }
+        }
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\domain\model\ErrptEvent.java =====
+package com.aoa.aix.domain.model;
+
+import lombok.Builder;
+import lombok.Data;
+import java.time.Instant;
+
+@Data
+@Builder
+public class ErrptEvent {
+    private Instant timestamp;
+    private String host;
+    private String identifier;     // ej: BFE4C025
+    private String errorClass;     // P/T/I/U  (Permanent / Temp / Info / Unknown)
+    private String errorType;      // H/S/O/U  (Hardware / Software / Operator / Undet.)
+    private String resourceName;   // ej: ent0, hdisk0, mem0
+    private String description;    // ej: ETHERNET DOWN
+    private Severity severity;
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\domain\model\LparstatSnapshot.java =====
+package com.aoa.aix.domain.model;
+
+import lombok.Builder;
+import lombok.Value;
+import java.time.Instant;
+
+@Value
+@Builder
+public class LparstatSnapshot {
+    Instant timestamp;
+    String host;
+    String lparName;
+    String environment;
+
+    // CPU
+    double cpuUser;
+    double cpuSys;
+    double cpuIdle;
+    double cpuWait;
+
+    // LPAR
+    double entitledCapacity;
+    double physicalCpuUsed;   // physc
+    double entcPct;
+    double lbusy;
+    double app;
+
+    // Memory / paging
+    double pagingSpaceUsedPct;
+    double pagingRate;
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\domain\model\LparTarget.java =====
+package com.aoa.aix.domain.model;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+/**
+ * Representa una LPAR AIX objetivo del agente de monitoreo.
+ *
+ * Es un objeto de dominio puro: no depende de Spring ni de ninguna
+ * tecnologÃ­a de infraestructura. Es inmutable en intenciÃ³n y se usa
+ * como contexto para:
+ *   - Ejecutar lparstat -X vÃ­a SSH.
+ *   - Resolver el origen de mensajes syslog entrantes.
+ *   - Enriquecer las seÃ±ales OTLP (logs y mÃ©tricas) con atributos
+ *     que permiten al backend distinguir cuÃ¡l LPAR generÃ³ la seÃ±al.
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class LparTarget {
+
+    /** Nombre lÃ³gico de la LPAR. Se usa como host.name en OTLP. */
+    private String name;
+
+    /** IP o hostname de red para conexiÃ³n SSH y resoluciÃ³n syslog. */
+    private String host;
+
+    /** Usuario de la cuenta de servicio del agente en la LPAR. */
+    private String sshUser;
+
+    /**
+     * Ruta absoluta a la llave privada SSH para autenticaciÃ³n.
+     * En modelo de credenciales comÃºn, todas las LPARs apuntan a la misma ruta.
+     * En modelo segregado, cada LPAR apunta a una ruta distinta.
+     */
+    private String sshKey;
+
+    /** Ambiente: prod, dev, qa. Mapea a deployment.environment en OTLP. */
+    private String environment;
+
+    /** Frame del Power donde reside la LPAR. Contexto del hipervisor. */
+    private String frame;
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\domain\model\MemoryAlert.java =====
+package com.aoa.aix.domain.model;
+
+import lombok.Builder;
+import lombok.Value;
+
+@Value
+@Builder
+public class MemoryAlert {
+    String host;
+    String reason;
+    String metric;     // ej: paging.used_pct
+    double value;
+    double threshold;
+    Severity severity;
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\domain\model\RawAixEvent.java =====
+package com.aoa.aix.domain.model;
+
+import lombok.Builder;
+import lombok.Value;
+import java.time.Instant;
+import java.util.Map;
+
+@Value
+@Builder
+public class RawAixEvent {
+    Instant timestamp;
+    String host;
+    String source;
+    String message;
+    Severity severity;
+    Map<String, String> attributes;
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\domain\model\Severity.java =====
+package com.aoa.aix.domain.model;
+
+public enum Severity {
+    INFO, WARN, CRITICAL
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\domain\service\AixErrorClassifier.java =====
+package com.aoa.aix.domain.service;
+
+import com.aoa.aix.domain.model.ErrptEvent;
+import com.aoa.aix.domain.model.Severity;
+import org.springframework.stereotype.Component;
+
+import java.util.Set;
+
+@Component
+public class AixErrorClassifier {
+
+    private static final Set<String> CRITICAL_IDS = Set.of(
+        "C5C09FFA", "369D049B", "BFE4C025", "AA8AB241"
+    );
+
+    private static final Set<String> CRITICAL_KEYWORDS = Set.of(
+        "FAILURE", "CRASH", "DOWN", "DEAD", "FATAL", "PANIC"
+    );
+
+    private static final Set<String> WARN_KEYWORDS = Set.of(
+        "ERROR", "PREDICTED", "WARNING", "DEGRADED", "TIMEOUT", "RECOVERY"
+    );
+
+    /** Compat: firma antigua. */
+    public Severity classify(String identifier, String description) {
+        return classify(identifier, description, null, null);
+    }
+
+    /** Firma nueva: usa class (P/T/I) y type (H/S/O) para refinar. */
+    public Severity classify(ErrptEvent e) {
+        if (e == null) return Severity.INFO;
+        return classify(e.getIdentifier(), e.getDescription(),
+                        e.getErrorClass(), e.getErrorType());
+    }
+
+    public Severity classify(String identifier, String description,
+                             String errorClass, String errorType) {
+
+        if (identifier != null && CRITICAL_IDS.contains(identifier)) {
+            return Severity.CRITICAL;
+        }
+
+        String desc = description == null ? "" : description.toUpperCase();
+
+        // PERMANENT + HARDWARE = casi siempre crÃ­tico
+        if ("P".equalsIgnoreCase(errorClass) && "H".equalsIgnoreCase(errorType)) {
+            return Severity.CRITICAL;
+        }
+
+        if (containsAny(desc, CRITICAL_KEYWORDS)) return Severity.CRITICAL;
+        if (containsAny(desc, WARN_KEYWORDS))     return Severity.WARN;
+
+        if ("T".equalsIgnoreCase(errorClass)) return Severity.WARN;   // Temporary
+        if ("I".equalsIgnoreCase(errorClass)) return Severity.INFO;   // Informational
+
+        return Severity.INFO;
+    }
+
+    private boolean containsAny(String text, Set<String> kws) {
+        for (String k : kws) if (text.contains(k)) return true;
+        return false;
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\domain\service\MemoryAlertEvaluator.java =====
+package com.aoa.aix.domain.service;
+
+import com.aoa.aix.domain.model.LparstatSnapshot;
+import com.aoa.aix.domain.model.MemoryAlert;
+import com.aoa.aix.domain.model.Severity;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Component
+public class MemoryAlertEvaluator {
+
+    @Value("${aix.memory.paging-pct.warn:70.0}")
+    private double pagingPctWarn;
+
+    @Value("${aix.memory.paging-pct.critical:85.0}")
+    private double pagingPctCritical;
+
+    @Value("${aix.memory.paging-rate.warn:5.0}")
+    private double pagingRateWarn;
+
+    @Value("${aix.memory.paging-rate.critical:10.0}")
+    private double pagingRateCritical;
+
+    public List<MemoryAlert> evaluate(LparstatSnapshot s) {
+        List<MemoryAlert> alerts = new ArrayList<>();
+        if (s == null) return alerts;
+
+        double pct  = s.getPagingSpaceUsedPct();
+        double rate = s.getPagingRate();
+
+        if (pct >= pagingPctCritical) {
+            alerts.add(build(s, "PAGING_SPACE_CRITICAL", pct, pagingPctCritical,
+                             "paging.used_pct", Severity.CRITICAL));
+        } else if (pct >= pagingPctWarn) {
+            alerts.add(build(s, "PAGING_SPACE_HIGH", pct, pagingPctWarn,
+                             "paging.used_pct", Severity.WARN));
+        }
+
+        if (rate >= pagingRateCritical) {
+            alerts.add(build(s, "PAGING_RATE_CRITICAL", rate, pagingRateCritical,
+                             "paging.rate", Severity.CRITICAL));
+        } else if (rate >= pagingRateWarn) {
+            alerts.add(build(s, "PAGING_RATE_HIGH", rate, pagingRateWarn,
+                             "paging.rate", Severity.WARN));
+        }
+        return alerts;
+    }
+
+    private MemoryAlert build(LparstatSnapshot s, String reason, double value,
+                              double threshold, String metric, Severity sev) {
+        return MemoryAlert.builder()
+                .host(s.getHost())
+                .reason(reason)
+                .value(value)
+                .threshold(threshold)
+                .metric(metric)
+                .severity(sev)
+                .build();
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\config\AixProperties.java =====
+package com.aoa.aix.infrastructure.config;
+
+import com.aoa.aix.domain.model.LparTarget;
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Propiedades tipadas del agente AOA-AIX.
+ *
+ * Lee del application.yml la lista de LPARs objetivo y los parÃ¡metros
+ * operativos (intervalos de muestreo, configuraciÃ³n SSH, comando lparstat).
+ *
+ * Esta clase es el ÃšNICO punto donde Spring se acopla a la configuraciÃ³n:
+ * el resto de la aplicaciÃ³n recibe LparTarget como objeto de dominio puro.
+ */
+@Data
+@Configuration
+@ConfigurationProperties(prefix = "aix")
+public class AixProperties {
+
+    /** Lista de LPARs AIX que el agente debe monitorear. */
+    private List<LparTarget> lpars = new ArrayList<>();
+
+    /** ConfiguraciÃ³n de conexiÃ³n SSH (compartida entre todas las LPARs). */
+    private Ssh ssh = new Ssh();
+
+    /** ConfiguraciÃ³n del recolector lparstat. */
+    private Lparstat lparstat = new Lparstat();
+
+    /** ConfiguraciÃ³n del servicio de alertas predictivas de memoria. */
+    private Memory memory = new Memory();
+
+    // -------------------------------------------------------------
+    // Subgrupos de propiedades
+    // -------------------------------------------------------------
+
+    @Data
+    public static class Ssh {
+        /** Puerto SSH estÃ¡ndar en las LPARs (tÃ­picamente 22). */
+        private int port = 22;
+
+        /** Timeout de conexiÃ³n en milisegundos. */
+        private int connectTimeoutMs = 5000;
+
+        /** Timeout de lectura del comando remoto en milisegundos. */
+        private int readTimeoutMs = 10000;
+
+        /** Comando a ejecutar para obtener mÃ©tricas en formato XML. */
+        private String command = "lparstat -X";
+
+        /**
+         * Si es true, omite la verificaciÃ³n de host keys (NO recomendado en prod).
+         * En producciÃ³n debe ser false y usar known_hosts.
+         */
+        private boolean skipHostKeyVerification = false;
+
+        /** Ruta al archivo known_hosts cuando skipHostKeyVerification = false. */
+        private String knownHostsPath;
+    }
+
+    @Data
+    public static class Lparstat {
+        /** Intervalo de muestreo en milisegundos (por defecto 30s). */
+        private long intervalMs = 30000;
+    }
+
+    @Data
+    public static class Memory {
+        /** Intervalo de evaluaciÃ³n de alertas de memoria (por defecto 60s). */
+        private long intervalMs = 60000;
+    }
+	
+	@Data
+	public static class Sampler {	
+		private long intervalMs = 30000;
+		private int maxParallel = 8;
+	}
+
+	private Sampler sampler = new Sampler();
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\config\BeansConfig.java =====
+package com.aoa.aix.infrastructure.config;
+
+import com.aoa.aix.application.port.in.IngestErrptUseCase;
+import com.aoa.aix.application.port.in.IngestLparstatUseCase;
+import com.aoa.aix.application.port.out.LparstatCommandExecutor;
+import com.aoa.aix.application.port.out.OtlpLogPublisher;
+import com.aoa.aix.application.port.out.OtlpMetricPublisher;
+import com.aoa.aix.application.service.ErrptIngestService;
+import com.aoa.aix.application.service.LparstatIngestService;
+import com.aoa.aix.domain.service.AixErrorClassifier;
+import com.aoa.aix.domain.service.MemoryAlertEvaluator;
+import com.aoa.aix.infrastructure.outbound.parser.ErrptParser;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class BeansConfig {
+
+    @Bean public AixErrorClassifier aixErrorClassifier() { return new AixErrorClassifier(); }
+    @Bean public MemoryAlertEvaluator memoryAlertEvaluator() { return new MemoryAlertEvaluator(); }
+
+    @Bean
+    public IngestErrptUseCase ingestErrptUseCase(ErrptParser parser,
+                                                 AixErrorClassifier classifier,
+                                                 OtlpLogPublisher publisher) {
+        return new ErrptIngestService(parser, classifier, publisher);
+    }
+
+    @Bean
+    public IngestLparstatUseCase ingestLparstatUseCase(LparstatCommandExecutor executor,
+                                                      MemoryAlertEvaluator evaluator,
+                                                      OtlpMetricPublisher publisher) {
+        return new LparstatIngestService(executor, evaluator, publisher);
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\config\OpenTelemetryConfig.java =====
+package com.aoa.aix.infrastructure.config;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.exporter.otlp.http.logs.OtlpHttpLogRecordExporter;
+import io.opentelemetry.exporter.otlp.http.metrics.OtlpHttpMetricExporter;
+import io.opentelemetry.exporter.otlp.logs.OtlpGrpcLogRecordExporter;
+import io.opentelemetry.exporter.otlp.metrics.OtlpGrpcMetricExporter;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.common.export.RetryPolicy;
+import io.opentelemetry.sdk.logs.SdkLoggerProvider;
+import io.opentelemetry.sdk.logs.export.BatchLogRecordProcessor;
+import io.opentelemetry.sdk.logs.export.LogRecordExporter;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.export.MetricExporter;
+import io.opentelemetry.sdk.metrics.export.PeriodicMetricReader;
+import io.opentelemetry.sdk.resources.Resource;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.time.Duration;
+import java.util.Arrays;
+
+@Slf4j
+@Configuration
+public class OpenTelemetryConfig {
+	
+	@Value("${otel.service.name:aoa-aix-logs-agent}")     private String serviceName;
+	@Value("${otel.exporter.otlp.endpoint:http://localhost:4317}") private String endpoint;
+	@Value("${otel.exporter.otlp.protocol:grpc}")         private String protocol;
+	@Value("${otel.exporter.otlp.timeout-ms:10000}")      private long   timeoutMs;
+	@Value("${otel.exporter.otlp.compression:gzip}")      private String compression;
+    @Value("${spring.profiles.active:dev}") private String env;
+    @Value("${otel.exporter.otlp.headers:}")     private String headers;
+
+    @Value("${otel.retry.enabled:true}")           private boolean retryEnabled;
+    @Value("${otel.retry.max-attempts:5}")         private int     retryMaxAttempts;
+    @Value("${otel.retry.initial-backoff-ms:1000}")private long    initialBackoffMs;
+    @Value("${otel.retry.max-backoff-ms:30000}")   private long    maxBackoffMs;
+    @Value("${otel.retry.backoff-multiplier:2.0}") private double  backoffMultiplier;
+
+    @Value("${otel.buffer.max-queue-size:10000}")        private int  maxQueueSize;
+    @Value("${otel.buffer.schedule-delay-ms:5000}")      private long scheduleDelayMs;
+    @Value("${otel.buffer.export-timeout-ms:30000}")     private long exportTimeoutMs;
+    @Value("${otel.buffer.max-export-batch-size:512}")   private int  maxExportBatchSize;
+
+    @Bean
+    public OpenTelemetry openTelemetry() {
+        Resource resource = Resource.getDefault().merge(
+                Resource.create(Attributes.builder()
+                        .put(AttributeKey.stringKey("service.name"),        serviceName)
+                        //.put(AttributeKey.stringKey("deployment.environment"), env)
+                        .put(AttributeKey.stringKey("aix.agent.version"),  "0.0.1")
+                        .build()));
+
+        // â”€â”€ PolÃ­tica de reintentos con backoff exponencial â”€â”€
+        RetryPolicy retryPolicy = RetryPolicy.builder()
+                .setMaxAttempts(retryEnabled ? retryMaxAttempts : 1)
+                .setInitialBackoff(Duration.ofMillis(initialBackoffMs))
+                .setMaxBackoff(Duration.ofMillis(maxBackoffMs))
+                .setBackoffMultiplier(backoffMultiplier)
+                .build();
+
+        // â”€â”€ Exporters OTLP (logs + mÃ©tricas) â”€â”€
+        LogRecordExporter logExporter = buildLogExporter(retryPolicy);
+        MetricExporter   metricExporter = buildMetricExporter(retryPolicy);
+
+        // â”€â”€ Buffer/Batch en memoria: si OTLP falla, los datos esperan en cola â”€â”€
+        SdkLoggerProvider loggerProvider = SdkLoggerProvider.builder()
+                .setResource(resource)
+                .addLogRecordProcessor(
+                        BatchLogRecordProcessor.builder(logExporter)
+                                .setMaxQueueSize(maxQueueSize)
+                                .setMaxExportBatchSize(maxExportBatchSize)
+                                .setScheduleDelay(Duration.ofMillis(scheduleDelayMs))
+                                .setExporterTimeout(Duration.ofMillis(exportTimeoutMs))
+                                .build())
+                .build();
+
+        SdkMeterProvider meterProvider = SdkMeterProvider.builder()
+                .setResource(resource)
+                .registerMetricReader(
+                        PeriodicMetricReader.builder(metricExporter)
+                                .setInterval(Duration.ofMillis(scheduleDelayMs))
+                                .build())
+                .build();
+
+        OpenTelemetrySdk sdk = OpenTelemetrySdk.builder()
+                .setLoggerProvider(loggerProvider)
+                .setMeterProvider(meterProvider)
+                .build();
+
+        // Cierre ordenado al apagar la JVM (flush del buffer)
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("Shutdown OTel SDK: vaciando buffersâ€¦");
+            sdk.getSdkLoggerProvider().shutdown().join(10, java.util.concurrent.TimeUnit.SECONDS);
+            sdk.getSdkMeterProvider().shutdown().join(10, java.util.concurrent.TimeUnit.SECONDS);
+        }));
+
+        log.info("OTel inicializado | endpoint={} protocol={} env={} retry={}x",
+                endpoint, protocol, env, retryMaxAttempts);
+
+        return sdk;
+    }
+
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    private LogRecordExporter buildLogExporter(RetryPolicy retry) {
+        if ("http/protobuf".equalsIgnoreCase(protocol)) {
+            var b = OtlpHttpLogRecordExporter.builder()
+                    .setEndpoint(endpoint)
+                    .setTimeout(Duration.ofMillis(timeoutMs))
+                    .setRetryPolicy(retry);
+            applyCompression(b::setCompression);
+            applyHeaders(b::addHeader);
+            return b.build();
+        }
+        var b = OtlpGrpcLogRecordExporter.builder()
+                .setEndpoint(endpoint)
+                .setTimeout(Duration.ofMillis(timeoutMs))
+                .setRetryPolicy(retry);
+        applyCompression(b::setCompression);
+        applyHeaders(b::addHeader);
+        return b.build();
+    }
+
+    private MetricExporter buildMetricExporter(RetryPolicy retry) {
+        if ("http/protobuf".equalsIgnoreCase(protocol)) {
+            var b = OtlpHttpMetricExporter.builder()
+                    .setEndpoint(endpoint)
+                    .setTimeout(Duration.ofMillis(timeoutMs))
+                    .setRetryPolicy(retry);
+            applyCompression(b::setCompression);
+            applyHeaders(b::addHeader);
+            return b.build();
+        }
+        var b = OtlpGrpcMetricExporter.builder()
+                .setEndpoint(endpoint)
+                .setTimeout(Duration.ofMillis(timeoutMs))
+                .setRetryPolicy(retry);
+        applyCompression(b::setCompression);
+        applyHeaders(b::addHeader);
+        return b.build();
+    }
+
+    private void applyCompression(java.util.function.Consumer<String> setter) {
+        if (compression != null && !compression.isBlank() && !"none".equalsIgnoreCase(compression)) {
+            setter.accept(compression);
+        }
+    }
+
+    private void applyHeaders(java.util.function.BiConsumer<String, String> adder) {
+        if (headers == null || headers.isBlank()) return;
+        Arrays.stream(headers.split(","))
+                .map(String::trim).filter(s -> s.contains("="))
+                .forEach(h -> {
+                    String[] kv = h.split("=", 2);
+                    adder.accept(kv[0].trim(), kv[1].trim());
+                });
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\config\SyslogIngestConfig.java =====
+package com.aoa.aix.infrastructure.config;
+
+import com.aoa.aix.infrastructure.inbound.syslog.SyslogMessageHandler;
+import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.integration.channel.DirectChannel;
+import org.springframework.integration.ip.tcp.connection.AbstractServerConnectionFactory;
+import org.springframework.integration.ip.tcp.connection.TcpNioServerConnectionFactory;
+import org.springframework.integration.ip.udp.UnicastReceivingChannelAdapter;
+import org.springframework.integration.syslog.inbound.TcpSyslogReceivingChannelAdapter;
+import org.springframework.integration.syslog.inbound.UdpSyslogReceivingChannelAdapter;
+
+@Slf4j
+@Configuration
+@RequiredArgsConstructor
+public class SyslogIngestConfig {
+
+    public static final String SYSLOG_CHANNEL = "syslogInputChannel";
+
+    private final SyslogMessageHandler syslogMessageHandler;
+
+    @Value("${aix.syslog.udp-port:1514}")
+    private int udpPort;
+
+    @Value("${aix.syslog.tcp-port:1514}")
+    private int tcpPort;
+
+    @Bean(name = SYSLOG_CHANNEL)
+    public DirectChannel syslogInputChannel() {
+        DirectChannel channel = new DirectChannel();
+        channel.subscribe(syslogMessageHandler);
+        log.info("âœ… SyslogMessageHandler subscribed to '{}'", SYSLOG_CHANNEL);
+        return channel;
+    }
+
+    @PostConstruct
+    public void init() {
+        log.info("SyslogIngestConfig: udpPort={}, tcpPort={}", udpPort, tcpPort);
+    }
+
+    // â”€â”€ UDP â”€â”€
+    @Bean
+    public UnicastReceivingChannelAdapter udpReceiver() {
+        UnicastReceivingChannelAdapter r = new UnicastReceivingChannelAdapter(udpPort);
+        r.setAutoStartup(false);
+        return r;
+    }
+
+    @Bean(initMethod = "start")
+    public UdpSyslogReceivingChannelAdapter udpSyslogAdapter(
+            UnicastReceivingChannelAdapter udpReceiver) {
+        UdpSyslogReceivingChannelAdapter a = new UdpSyslogReceivingChannelAdapter();
+        a.setUdpAdapter(udpReceiver);
+        a.setOutputChannelName(SYSLOG_CHANNEL);   // â† resoluciÃ³n por nombre
+        a.setAutoStartup(true);
+        log.info("UDP Syslog adapter configured on port {} â†’ channel '{}'", udpPort, SYSLOG_CHANNEL);
+        return a;
+    }
+
+    // â”€â”€ TCP â”€â”€
+    @Bean
+    public AbstractServerConnectionFactory tcpConnectionFactory() {
+        return new TcpNioServerConnectionFactory(tcpPort);
+    }
+
+    @Bean(initMethod = "start")
+    public TcpSyslogReceivingChannelAdapter tcpSyslogAdapter(
+            AbstractServerConnectionFactory tcpConnectionFactory) {
+        TcpSyslogReceivingChannelAdapter a = new TcpSyslogReceivingChannelAdapter();
+        a.setConnectionFactory(tcpConnectionFactory);
+        a.setOutputChannelName(SYSLOG_CHANNEL);   // â† resoluciÃ³n por nombre
+        a.setAutoStartup(true);
+        log.info("TCP Syslog adapter configured on port {} â†’ channel '{}'", tcpPort, SYSLOG_CHANNEL);
+        return a;
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\dto\LparstatModel.java =====
+package com.aoa.aix.infrastructure.dto;
+
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlProperty;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlRootElement;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Data;
+
+@Data
+@JacksonXmlRootElement(localName = "lparstat")
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class LparstatModel {
+
+    @JacksonXmlProperty(localName = "system_configuration")
+    private SystemConfiguration systemConfiguration;
+
+    @JacksonXmlProperty(localName = "utilization")
+    private Utilization utilization;
+
+    @JacksonXmlProperty(localName = "memory")
+    private Memory memory;
+
+    // ---- Compatibilidad con cÃ³digo existente ----
+    public Cpu getCpu() {
+        if (utilization == null) return null;
+        Cpu c = new Cpu();
+        c.setUser(utilization.getUserPct());
+        c.setSys(utilization.getSysPct());
+        c.setIdle(utilization.getIdlePct());
+        return c;
+    }
+
+    public Lpar getLpar() {
+        if (utilization == null) return null;
+        Lpar l = new Lpar();
+        l.setEntitled(systemConfiguration != null ? systemConfiguration.getEntitledCapacity() : 0.0);
+        l.setPhysicalUsed(utilization.getPhysc());
+        return l;
+    }
+
+    // ---- DTOs anidados segÃºn XML real ----
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class SystemConfiguration {
+        private String hostname;
+        @JacksonXmlProperty(localName = "partition_name")   private String partitionName;
+        @JacksonXmlProperty(localName = "partition_number") private int partitionNumber;
+        private String type;
+        private String mode;
+        @JacksonXmlProperty(localName = "entitled_capacity")  private double entitledCapacity;
+        @JacksonXmlProperty(localName = "online_virtual_cpus") private int onlineVirtualCpus;
+        @JacksonXmlProperty(localName = "online_memory")      private int onlineMemory;
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Utilization {
+        @JacksonXmlProperty(localName = "user_pct") private double userPct;
+        @JacksonXmlProperty(localName = "sys_pct")  private double sysPct;
+        @JacksonXmlProperty(localName = "wait_pct") private double waitPct;
+        @JacksonXmlProperty(localName = "idle_pct") private double idlePct;
+        private double physc;
+        @JacksonXmlProperty(localName = "entc_pct") private double entcPct;
+        private double lbusy;
+        private double app;
+        private long vcsw;
+        private long phint;
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Memory {
+        @JacksonXmlProperty(localName = "real_mb")               private long realMb;
+        @JacksonXmlProperty(localName = "paging_space_mb")       private long pagingSpaceMb;
+        @JacksonXmlProperty(localName = "paging_space_used_pct") private double pagingUsedPct;
+        @JacksonXmlProperty(localName = "paging_rate")           private double pagingRate;
+    }
+
+    // ---- Wrappers legacy para no romper LparstatXmlParser ----
+    @Data public static class Cpu  { private double user; private double sys; private double idle; }
+    @Data public static class Lpar { private double entitled; private double physicalUsed; }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\inbound\schedule\LparstatScheduler.java =====
+package com.aoa.aix.infrastructure.inbound.schedule;
+
+import com.aoa.aix.application.port.in.IngestLparstatUseCase;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class LparstatScheduler {
+
+    private final IngestLparstatUseCase ingestLparstat;
+
+    @Scheduled(fixedRateString = "${aix.lparstat.interval-ms:30000}")
+    public void poll() {
+        log.debug("Triggering lparstat collection");
+        ingestLparstat.collectAndIngest();
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\inbound\syslog\SyslogMessageHandler.java =====
+package com.aoa.aix.infrastructure.inbound.syslog;
+
+import com.aoa.aix.application.port.in.IngestErrptUseCase;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.MessageHandler;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class SyslogMessageHandler implements MessageHandler {
+
+    private final IngestErrptUseCase ingestErrpt;
+
+    @Override
+    public void handleMessage(Message<?> message) {
+        Object payload = message.getPayload();
+        String text;
+
+        if (payload instanceof Map<?, ?> map && map.containsKey("UNDECODED")) {
+            text = map.get("UNDECODED").toString();
+        } else if (payload instanceof byte[] bytes) {
+            text = new String(bytes);
+        } else {
+            text = String.valueOf(payload);
+        }
+
+        String host = String.valueOf(message.getHeaders().getOrDefault("ip_address", "unknown"));
+        log.info("Syslog received from {}: {}", host, text);
+
+        try {
+            ingestErrpt.ingest(text, host);
+        } catch (Exception ex) {
+            log.error("Failed ingesting errpt event: {}", ex.getMessage(), ex);
+        }
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\outbound\command\FileLparstatExecutor.java =====
+package com.aoa.aix.infrastructure.outbound.command;
+
+import com.aoa.aix.application.port.out.LparstatCommandExecutor;
+import com.aoa.aix.domain.model.LparstatSnapshot;
+import com.aoa.aix.infrastructure.outbound.parser.LparstatXmlParser;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Profile;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.stereotype.Component;
+
+import java.io.InputStream;
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+/**
+ * Executor de DESARROLLO: lee un XML de muestra desde classpath, file: o ruta absoluta.
+ * Ãštil para correr sin AIX real (Windows/Mac dev box, CI, demos).
+ */
+@Slf4j
+@Component
+@Profile("!ssh")   // se usa cuando NO estÃ¡ activo 'ssh' (modo file/simulador)
+@RequiredArgsConstructor
+public class FileLparstatExecutor implements LparstatCommandExecutor {
+
+    @Value("${aix.lparstat.sample-file:classpath:samples/lparstat-sample.xml}")
+    private String sampleFile;
+
+    private final LparstatXmlParser parser;
+    private final ResourceLoader resourceLoader;
+
+    @Override
+    public List<LparstatSnapshot> executeAll() {
+        try {
+            Resource res = resourceLoader.getResource(sampleFile);
+            if (!res.exists()) {
+                log.warn("Sample file no encontrado: {}", sampleFile);
+                return List.of();
+            }
+            String xml;
+            try (InputStream in = res.getInputStream()) {
+                xml = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            }
+            String host = InetAddress.getLocalHost().getHostName();
+            LparstatSnapshot snapshot = parser.parse(xml, host, host, "dev");
+            if (snapshot == null) {
+                log.warn("Parser devolviÃ³ null para sample {}", sampleFile);
+                return List.of();
+            }
+            log.debug("Sample procesado OK: cpuUser={} memPaging={}",
+                    snapshot.getCpuUser(), snapshot.getPagingSpaceUsedPct());
+            return List.of(snapshot);
+        } catch (Exception e) {
+            log.error("Error leyendo sample file {}: {}", sampleFile, e.getMessage(), e);
+            return List.of();
+        }
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\outbound\command\ShellLparstatExecutor.java =====
+package com.aoa.aix.infrastructure.outbound.command;
+
+import com.aoa.aix.application.port.out.LparstatCommandExecutor;
+import com.aoa.aix.domain.model.LparstatSnapshot;
+import com.aoa.aix.infrastructure.outbound.parser.LparstatXmlParser;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Profile;
+import org.springframework.stereotype.Component;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+/**
+ * Executor LOCAL: ejecuta `lparstat -X` en la mÃ¡quina donde corre el agente.
+ * SÃ³lo aplica cuando el agente vive DENTRO de una LPAR AIX.
+ */
+@Slf4j
+@Component
+@Profile("local")
+@RequiredArgsConstructor
+public class ShellLparstatExecutor implements LparstatCommandExecutor {
+
+    @Value("${aix.lparstat.command:lparstat -X}")
+    private String command;
+
+    private final LparstatXmlParser parser;
+
+    @Override
+    public List<LparstatSnapshot> executeAll() {
+        try {
+            Process p = new ProcessBuilder(command.split("\\s+"))
+                    .redirectErrorStream(true)
+                    .start();
+
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader r = new BufferedReader(
+                    new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line).append('\n');
+            }
+            int exit = p.waitFor();
+            if (exit != 0) {
+                log.warn("lparstat exit={} output={}", exit, sb);
+                return List.of();
+            }
+
+            String host = InetAddress.getLocalHost().getHostName();
+            LparstatSnapshot snapshot = parser.parse(sb.toString(), host, host, "local");
+            return snapshot == null ? List.of() : List.of(snapshot);
+        } catch (Exception e) {
+            log.error("Error ejecutando '{}': {}", command, e.getMessage());
+            return List.of();
+        }
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\outbound\otlp\OtlpLogPublisherAdapter.java =====
+package com.aoa.aix.infrastructure.outbound.otlp;
+
+import com.aoa.aix.application.port.out.OtlpLogPublisher;
+import com.aoa.aix.domain.model.RawAixEvent;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.logs.Logger;
+import io.opentelemetry.api.logs.Severity;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+public class OtlpLogPublisherAdapter implements OtlpLogPublisher {
+
+    private final Logger otelLogger;
+
+    public OtlpLogPublisherAdapter(OpenTelemetry openTelemetry) {
+        this.otelLogger = openTelemetry.getLogsBridge().get("aoa.aix.agent");
+    }
+
+    @Override
+    public void publish(RawAixEvent event) {
+        var builder = otelLogger.logRecordBuilder()
+            .setSeverity(mapSeverity(event.getSeverity()))
+			.setSeverityText(event.getSeverity().name())   // â† aÃ±ade esta lÃ­nea
+            .setBody(event.getMessage())
+            .setAttribute(AttributeKey.stringKey("host.name"), event.getHost())
+            .setAttribute(AttributeKey.stringKey("aix.source"), event.getSource());
+
+        event.getAttributes().forEach((k, v) ->
+            builder.setAttribute(AttributeKey.stringKey(k), v));
+
+        builder.emit();
+    }
+
+    private Severity mapSeverity(com.aoa.aix.domain.model.Severity s) {
+        return switch (s) {
+            case CRITICAL -> Severity.ERROR;
+            case WARN -> Severity.WARN;
+            default -> Severity.INFO;
+        };
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\outbound\otlp\OtlpMetricPublisherAdapter.java =====
+package com.aoa.aix.infrastructure.outbound.otlp;
+
+import com.aoa.aix.application.port.out.OtlpMetricPublisher;
+import com.aoa.aix.domain.model.LparstatSnapshot;
+import com.aoa.aix.domain.model.MemoryAlert;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.metrics.DoubleGauge;
+import io.opentelemetry.api.metrics.Meter;
+import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+public class OtlpMetricPublisherAdapter implements OtlpMetricPublisher {
+
+    private final Meter meter;
+
+    private DoubleGauge cpuUser, cpuSys, cpuIdle, cpuWait;
+    private DoubleGauge pagingPct, pagingRate;
+    private DoubleGauge lparPhysc, lparEntcPct, lparLbusy, lparApp, lparEntitled;
+    private DoubleGauge alertGauge;
+
+    public OtlpMetricPublisherAdapter(OpenTelemetry openTelemetry) {
+        this.meter = openTelemetry.getMeter("aoa.aix.agent");
+    }
+
+    @PostConstruct
+    void init() {
+        cpuUser = meter.gaugeBuilder("aix.cpu.user").setUnit("%").build();
+        cpuSys  = meter.gaugeBuilder("aix.cpu.sys").setUnit("%").build();
+        cpuIdle = meter.gaugeBuilder("aix.cpu.idle").setUnit("%").build();
+        cpuWait = meter.gaugeBuilder("aix.cpu.wait").setUnit("%").build();
+
+        pagingPct  = meter.gaugeBuilder("aix.memory.paging.used_pct").setUnit("%").build();
+        pagingRate = meter.gaugeBuilder("aix.memory.paging.rate").setUnit("pages/s").build();
+
+        lparPhysc    = meter.gaugeBuilder("aix.lpar.physc").build();
+        lparEntcPct  = meter.gaugeBuilder("aix.lpar.entc_pct").setUnit("%").build();
+        lparLbusy    = meter.gaugeBuilder("aix.lpar.lbusy").setUnit("%").build();
+        lparApp      = meter.gaugeBuilder("aix.lpar.app").build();
+        lparEntitled = meter.gaugeBuilder("aix.lpar.entitled_capacity").build();
+
+        alertGauge = meter.gaugeBuilder("aix.alert").build();
+    }
+
+    @Override
+    public void publishSnapshot(LparstatSnapshot s) {
+        Attributes attrs = Attributes.builder()
+                .put("host.name", s.getHost())
+                .put("lpar.name", s.getLparName())
+                .put("deployment.environment", s.getEnvironment())
+                .build();
+
+        cpuUser.set(s.getCpuUser(), attrs);
+        cpuSys.set(s.getCpuSys(), attrs);
+        cpuIdle.set(s.getCpuIdle(), attrs);
+        cpuWait.set(s.getCpuWait(), attrs);
+
+        pagingPct.set(s.getPagingSpaceUsedPct(), attrs);
+        pagingRate.set(s.getPagingRate(), attrs);
+
+        lparPhysc.set(s.getPhysicalCpuUsed(), attrs);
+        lparEntcPct.set(s.getEntcPct(), attrs);
+        lparLbusy.set(s.getLbusy(), attrs);
+        lparApp.set(s.getApp(), attrs);
+        lparEntitled.set(s.getEntitledCapacity(), attrs);
+    }
+
+    @Override
+    public void publishAlert(MemoryAlert alert) {
+        Attributes attrs = Attributes.builder()
+                .put("host.name",       alert.getHost())
+                .put("alert.reason",    alert.getReason())
+                .put("alert.metric",    alert.getMetric())
+                .put("alert.severity",  alert.getSeverity().name())
+                .put("alert.threshold", alert.getThreshold())
+                .build();
+        alertGauge.set(alert.getValue(), attrs);
+        log.info("ðŸš¨ Alert emitted: {} {}={} (>={})",
+                alert.getSeverity(), alert.getMetric(), alert.getValue(), alert.getThreshold());
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\outbound\parser\ErrptParser.java =====
+package com.aoa.aix.infrastructure.outbound.parser;
+
+import com.aoa.aix.domain.model.ErrptEvent;
+import com.aoa.aix.domain.model.Severity;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import java.time.Instant;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Slf4j
+@Component
+public class ErrptParser {
+
+    // <PRI>MMM dd HH:mm:ss host errpt: <body>
+    private static final Pattern SYSLOG_PREFIX =
+            Pattern.compile("^<\\d+>.*?\\s(\\S+)\\s+errpt:\\s*(.+)$");
+
+    // ID  TIMESTAMP  CLASS  TYPE  RESOURCE  DESCRIPTION...
+    private static final Pattern ERRPT_BODY =
+            Pattern.compile("^(\\S+)\\s+(\\S+)\\s+(\\S)\\s+(\\S)\\s+(\\S+)\\s+(.+)$");
+
+    public ErrptEvent parse(String payload, String sourceHost) {
+        if (payload == null || payload.isBlank()) {
+            return ErrptEvent.builder()
+                    .timestamp(Instant.now())
+                    .host(sourceHost)
+                    .identifier("UNKNOWN")
+                    .resourceName("UNKNOWN")
+                    .description("")
+                    .severity(Severity.INFO)
+                    .build();
+        }
+
+        String host = sourceHost;
+        String body = payload.trim();
+
+        Matcher sm = SYSLOG_PREFIX.matcher(body);
+        if (sm.matches()) {
+            host = sm.group(1);
+            body = sm.group(2).trim();
+        }
+
+        Matcher bm = ERRPT_BODY.matcher(body);
+        if (!bm.matches()) {
+            log.warn("Cannot parse errpt body: {}", body);
+            return ErrptEvent.builder()
+                    .timestamp(Instant.now())
+                    .host(host)
+                    .identifier("UNKNOWN")
+                    .resourceName("UNKNOWN")
+                    .description(body)
+                    .severity(Severity.INFO)
+                    .build();
+        }
+
+        return ErrptEvent.builder()
+                .timestamp(Instant.now())
+                .host(host)
+                .identifier(bm.group(1))
+                .errorClass(bm.group(3))
+                .errorType(bm.group(4))
+                .resourceName(bm.group(5))
+                .description(bm.group(6).trim())
+                .severity(Severity.INFO) // refinada por el classifier
+                .build();
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\outbound\parser\LparstatXmlParser.java =====
+package com.aoa.aix.infrastructure.outbound.parser;
+
+import com.aoa.aix.domain.model.LparstatSnapshot;
+import com.aoa.aix.infrastructure.dto.LparstatModel;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import java.time.Instant;
+
+@Slf4j
+@Component
+public class LparstatXmlParser {
+
+    private final XmlMapper xmlMapper = new XmlMapper();
+    {
+        xmlMapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    }
+
+    /** Compat: parser legado (host == lparName, env desconocido). */
+    public LparstatSnapshot parse(String xml, String host) {
+        return parse(xml, host, host, "unknown");
+    }
+
+    /** Parser multi-LPAR: incluye nombre lÃ³gico y entorno. */
+    public LparstatSnapshot parse(String xml, String host, String lparName, String environment) {
+        try {
+            LparstatModel m = xmlMapper.readValue(xml, LparstatModel.class);
+
+            LparstatModel.Utilization u = m.getUtilization();
+            LparstatModel.SystemConfiguration sc = m.getSystemConfiguration();
+            LparstatModel.Memory mem = m.getMemory();
+
+            return LparstatSnapshot.builder()
+                    .timestamp(Instant.now())
+                    .host(host)
+                    .lparName(lparName == null ? host : lparName)
+                    .environment(environment == null ? "unknown" : environment)
+
+                    // CPU
+                    .cpuUser(u != null ? u.getUserPct() : 0.0)
+                    .cpuSys (u != null ? u.getSysPct()  : 0.0)
+                    .cpuIdle(u != null ? u.getIdlePct() : 0.0)
+                    .cpuWait(u != null ? u.getWaitPct() : 0.0)
+
+                    // LPAR
+                    .entitledCapacity(sc != null ? sc.getEntitledCapacity() : 0.0)
+                    .physicalCpuUsed(u != null ? u.getPhysc()   : 0.0)
+                    .entcPct        (u != null ? u.getEntcPct() : 0.0)
+                    .lbusy          (u != null ? u.getLbusy()   : 0.0)
+                    .app            (u != null ? u.getApp()     : 0.0)
+
+                    // Memory
+                    .pagingSpaceUsedPct(mem != null ? mem.getPagingUsedPct() : 0.0)
+                    .pagingRate        (mem != null ? mem.getPagingRate()    : 0.0)
+
+                    .build();
+        } catch (Exception e) {
+            log.error("Error parsing lparstat XML for [{}]: {}", lparName, e.getMessage());
+            return null;
+        }
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\infrastructure\outbound\ssh\SshLparstatExecutor.java =====
+package com.aoa.aix.infrastructure.outbound.ssh;
+
+import com.aoa.aix.application.port.out.LparstatCommandExecutor;
+import com.aoa.aix.application.port.out.LparstatExecutionException;
+import com.aoa.aix.domain.model.LparTarget;
+import com.aoa.aix.domain.model.LparstatSnapshot;
+import com.aoa.aix.infrastructure.config.AixProperties;
+import com.aoa.aix.infrastructure.outbound.parser.LparstatXmlParser;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import net.schmizz.sshj.SSHClient;
+import net.schmizz.sshj.connection.channel.direct.Session;
+import net.schmizz.sshj.transport.verification.PromiscuousVerifier;
+import net.schmizz.sshj.userauth.keyprovider.KeyProvider;
+import org.springframework.context.annotation.Profile;
+import org.springframework.stereotype.Component;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+@Slf4j
+@Component
+@Profile("ssh")    // se usa con perfil ssh
+@RequiredArgsConstructor
+public class SshLparstatExecutor implements LparstatCommandExecutor {
+
+    private final AixProperties props;
+    private final LparstatXmlParser parser;
+
+    private ExecutorService pool;
+
+    @PostConstruct
+    void init() {
+        int n = props.getLpars() == null ? 0 : props.getLpars().size();
+        int maxParallel = props.getSampler() != null ? props.getSampler().getMaxParallel() : 4;
+        int poolSize = Math.max(1, Math.min(Math.max(n, 1), maxParallel));
+        this.pool = Executors.newFixedThreadPool(poolSize, r -> {
+            Thread t = new Thread(r, "ssh-lparstat");
+            t.setDaemon(true);
+            return t;
+        });
+        log.info("SshLparstatExecutor listo | lpars={} pool={}", n, poolSize);
+    }
+
+    @PreDestroy
+    void shutdown() {
+        if (pool != null) pool.shutdownNow();
+    }
+
+    @Override
+    public List<LparstatSnapshot> executeAll() {
+        List<LparTarget> targets = props.getLpars();
+        if (targets == null || targets.isEmpty()) {
+            log.warn("aix.lpars[] vacio; no hay LPARs para muestrear.");
+            return List.of();
+        }
+
+        long perTaskTimeoutMs = props.getSsh().getReadTimeoutMs() + 5_000L;
+
+        List<Future<LparstatSnapshot>> futures = new ArrayList<>(targets.size());
+        for (LparTarget t : targets) {
+            futures.add(pool.submit(() -> sampleOne(t)));
+        }
+
+        List<LparstatSnapshot> results = new ArrayList<>(targets.size());
+        for (int i = 0; i < futures.size(); i++) {
+            LparTarget t = targets.get(i);
+            try {
+                LparstatSnapshot s = futures.get(i).get(perTaskTimeoutMs, TimeUnit.MILLISECONDS);
+                if (s != null) results.add(s);
+            } catch (TimeoutException te) {
+                log.warn("[{}] Timeout esperando muestreo", t.getName());
+                futures.get(i).cancel(true);
+            } catch (ExecutionException ee) {
+                log.warn("[{}] Error en muestreo: {}", t.getName(),
+                        ee.getCause() == null ? ee.getMessage() : ee.getCause().getMessage());
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        return results;
+    }
+
+    private LparstatSnapshot sampleOne(LparTarget target) {
+        try {
+            String xml = fetchXmlOverSsh(target);
+            return parser.parse(xml, target.getHost(), target.getName(), target.getEnvironment());
+        } catch (LparstatExecutionException e) {
+            log.warn("[{}] SSH fallo: {}", target.getName(), e.getMessage());
+            return null;
+        } catch (Exception e) {
+            log.error("[{}] Error inesperado: {}", target.getName(), e.toString(), e);
+            return null;
+        }
+    }
+
+    private String fetchXmlOverSsh(LparTarget target) throws LparstatExecutionException {
+        AixProperties.Ssh sshCfg = props.getSsh();
+        try (SSHClient ssh = new SSHClient()) {
+            if (sshCfg.isSkipHostKeyVerification()) {
+                ssh.addHostKeyVerifier(new PromiscuousVerifier());
+            } else if (sshCfg.getKnownHostsPath() != null) {
+                ssh.loadKnownHosts(new File(sshCfg.getKnownHostsPath()));
+            } else {
+                ssh.loadKnownHosts();
+            }
+            ssh.setConnectTimeout(sshCfg.getConnectTimeoutMs());
+            ssh.setTimeout(sshCfg.getReadTimeoutMs());
+
+            ssh.connect(target.getHost(), sshCfg.getPort());
+            KeyProvider key = ssh.loadKeys(target.getSshKey());
+            ssh.authPublickey(target.getSshUser(), key);
+
+            try (Session session = ssh.startSession()) {
+                Session.Command cmd = session.exec(sshCfg.getCommand());
+                String stdout = readFully(cmd.getInputStream());
+                String stderr = readFully(cmd.getErrorStream());
+                cmd.join(sshCfg.getReadTimeoutMs(), TimeUnit.MILLISECONDS);
+                int exit = cmd.getExitStatus() == null ? -1 : cmd.getExitStatus();
+                if (exit != 0) {
+                    throw new LparstatExecutionException(
+                            String.format("[%s] lparstat exit=%d stderr=%s",
+                                    target.getName(), exit, stderr.trim()));
+                }
+                return stdout;
+            }
+        } catch (IOException e) {
+            throw new LparstatExecutionException(
+                    String.format("[%s] Error SSH a %s: %s",
+                            target.getName(), target.getHost(), e.getMessage()), e);
+        }
+    }
+
+    private String readFully(InputStream in) throws IOException {
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            in.transferTo(out);
+            return out.toString(StandardCharsets.UTF_8);
+        }
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\java\com\aoa\aix\AoaLogsAgentApplication.java =====
+package com.aoa.aix;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.integration.config.EnableIntegration;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableIntegration
+@EnableScheduling
+public class AoaLogsAgentApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(AoaLogsAgentApplication.class, args);
+    }
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\resources\samples\lparstat-sample.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<lparstat>
+    <cpu>
+        <user>32.5</user>
+        <sys>14.2</sys>
+        <idle>53.3</idle>
+    </cpu>
+    <lpar>
+        <entitled>2.0</entitled>
+        <physicalUsed>1.4</physicalUsed>
+    </lpar>
+    <memory>
+        <pagingUsedPct>27.8</pagingUsedPct>
+        <pagingRate>120.5</pagingRate>
+    </memory>
+</lparstat>
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\resources\application-dev.yml =====
+# ============================================================
+# Perfil DEV â€” desarrollo local SIN Docker, SIN AIX, SIN SSH
+# Lee el XML de muestra desde classpath y emite OTLP a localhost.
+# ============================================================
+
+aix:
+  syslog:
+    udp-port: 5140
+    tcp-port: 5141
+  lparstat:
+    sample-file: classpath:samples/lparstat-sample.xml
+    interval-ms: 10000
+  memory:
+    interval-ms: 20000
+  lpars:
+    - name: aix-mock-1
+      host: aix-mock
+      ssh-user: aixmock
+      ssh-key: /app/keys/aoa_aix_mock
+      environment: dev
+      frame: mock-frame
+
+otel:
+  exporter:
+    otlp:
+      endpoint: http://localhost:4317
+      protocol: grpc
+
+logging:
+  level:
+    com.aoa.aix: DEBUG
+    root: INFO
+
+server:
+  port: 8081
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\resources\application-prod.yml =====
+spring:
+  config:
+    activate:
+      on-profile: prod
+
+server:
+  port: 8081
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+otel:
+  exporter:
+    otlp:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+      timeout: 10000
+  resource:
+    attributes:
+      service.name: aoa-aix-logs-agent
+      service.version: @project.version@
+      deployment.environment: ${DEPLOYMENT_ENV:prod}
+      aix.agent.version: @project.version@
+
+aix:
+  scheduler:
+    interval-seconds: ${AIX_SCHEDULER_INTERVAL:10}
+  syslog:
+    udp-port: ${AIX_SYSLOG_UDP_PORT:5140}
+    tcp-port: ${AIX_SYSLOG_TCP_PORT:5141}
+  alerts:
+    paging-used-warn-pct: 70
+    paging-used-critical-pct: 85
+    paging-rate-warn: 5
+    paging-rate-critical: 10
+  ssh:
+    user: ${AIX_SSH_USER}
+    private-key-path: ${AIX_SSH_KEY_PATH:/etc/aoa/keys/id_rsa}
+    skip-host-key-verification: false
+    known-hosts-path: ${AIX_SSH_KNOWN_HOSTS:/etc/aoa/keys/known_hosts}
+    connect-timeout-ms: 10000
+    command-timeout-ms: 15000
+  # âš ï¸ La lista real de LPARs se inyecta vÃ­a ConfigMap externo o
+  # archivo montado en /app/config/application.yml (no se versiona aquÃ­).
+  lpars: []
+
+logging:
+  level:
+    root: INFO
+    com.aoa.aix: INFO
+    net.schmizz.sshj: WARN
+  pattern:
+    console: '{"ts":"%d{yyyy-MM-dd''T''HH:mm:ss.SSSXXX}","level":"%level","logger":"%logger{36}","thread":"%thread","msg":"%message"}%n'
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\resources\application-ssh.yml =====
+aix:
+  ssh:
+    host: ${AIX_SSH_HOST:aix-mock}
+    port: ${AIX_SSH_PORT:22}
+    user: ${AIX_SSH_USER:aixmock}
+    private-key-path: ${AIX_SSH_PRIVATE_KEY_PATH:/app/keys/aoa_aix_mock}
+    command: "lparstat -X"
+    connect-timeout-ms: 5000
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\main\resources\application.yml =====
+# ============================================================
+# AOA-AIX Logs Agent â€” ConfiguraciÃ³n base
+# ============================================================
+# Las propiedades especÃ­ficas de ambiente viven en:
+#   - application-dev.yml   (desarrollo local)
+#   - application-prod.yml  (producciÃ³n)
+# El perfil activo se selecciona vÃ­a variable de entorno:
+#   SPRING_PROFILES_ACTIVE=dev | prod
+# ============================================================
+
+spring:
+  application:
+    name: aoa-aix-logs-agent
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+
+server:
+  port: 8080   # endpoint de salud/management del agente
+
+# ------------------------------------------------------------
+# ConfiguraciÃ³n del agente AIX (consumida por AixProperties)
+# ------------------------------------------------------------
+aix:
+  lpars:
+    - name: aix-mock-1
+      host: aix-mock
+      ssh-user: aixmock
+      ssh-key: /app/keys/aoa_aix_mock
+      environment: dev
+      frame: mock-frame
+  ssh:
+    host: ${AIX_SSH_HOST:aix-mock}
+    port: ${AIX_SSH_PORT:22}
+    user: ${AIX_SSH_USER:aixmock}
+    private-key-path: ${AIX_SSH_PRIVATE_KEY_PATH:/app/keys/aoa_aix_mock}
+    command: "lparstat -X"
+    connect-timeout-ms: 5000
+    read-timeout-ms: 10000
+    skip-host-key-verification: true
+  # Intervalo de muestreo de lparstat -X (ms).
+  lparstat:
+    interval-ms: 30000
+
+  # Intervalo de evaluaciÃ³n de alertas predictivas de memoria (ms).
+  memory:
+    interval-ms: 60000
+
+  sampler:
+    interval-ms: 30000    # muestreo cada 30s
+    max-parallel: 8       # mÃ¡ximo de LPARs en paralelo por tick
+    
+  # La lista 'aix.lpars' se define en cada perfil (dev/prod).
+
+# ------------------------------------------------------------
+# OpenTelemetry â€” el endpoint real vive en cada perfil
+# ------------------------------------------------------------
+otel:
+  service:
+    name: aoa-aix-logs-agent
+
+  exporter:
+    otlp:
+      # endpoint se define por perfil (dev/prod)
+      protocol: grpc          # grpc | http/protobuf
+      timeout-ms: 10000
+      compression: gzip       # gzip | none
+      headers: ""             # formato: "k1=v1,k2=v2"
+
+  retry:
+    enabled: true
+    max-attempts: 5
+    initial-backoff-ms: 1000
+    max-backoff-ms: 30000
+    backoff-multiplier: 2.0
+
+  buffer:
+    max-queue-size: 10000
+    schedule-delay-ms: 5000
+    export-timeout-ms: 30000
+    max-export-batch-size: 512
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+logging:
+  level:
+    root: INFO
+    com.aoa.aix: DEBUG
+    org.springframework.integration: INFO
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\src\test\java\com\aoa\aix\aoa_logs_agent\AoaLogsAgentApplicationTests.java =====
+package com.aoa.aix.aoa_logs_agent;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
+
+@SpringBootTest
+class AoaLogsAgentApplicationTests {
+
+	@Test
+	void contextLoads() {
+	}
+
+}
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\docker-compose.yml =====
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./otel-logs:/var/log/otel
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    networks:
+      - aoa-net
+
+  aix-mock:
+    build:
+      context: ./aix-mock
+      dockerfile: Dockerfile
+    container_name: aix-mock
+    ports:
+      - "2222:22"     # SSH expuesto en localhost:2222
+    networks:
+      - aoa-net
+
+  aoa-logs-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aoa-logs-agent
+    depends_on:
+      - otel-collector
+      - aix-mock
+
+    environment:
+      SPRING_PROFILES_ACTIVE: dev,ssh
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317   
+      AIX_SSH_HOST: aix-mock
+      AIX_SSH_PORT: "22"
+      AIX_SSH_USER: aixmock
+      AIX_SSH_PRIVATE_KEY_PATH: /app/keys/aoa_aix_mock
+    volumes:
+      - ./aix-mock/keys:/app/keys:ro
+    ports:
+      - "1514:1514/udp"
+      - "1514:1514/tcp"
+    networks:
+      - aoa-net
+
+networks:
+  aoa-net:
+    driver: bridge
+===== C:\Desarrollo\Observa\aoa_logs\aoa_logs_agent\pom.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>org.springframework.boot</groupId>
+		<artifactId>spring-boot-starter-parent</artifactId>
+		<version>3.5.14</version>
+		<relativePath/>
+	</parent>
+	<groupId>com.aoa.aix</groupId>
+	<artifactId>aoa_logs_agent</artifactId>
+	<version>0.0.1-SNAPSHOT</version>
+	<name>aoa_logs_agent</name>
+	<description/>
+	<url/>
+	<licenses>
+		<license/>
+	</licenses>
+	<developers>
+		<developer/>
+	</developers>
+	<scm>
+		<connection/>
+		<developerConnection/>
+		<tag/>
+		<url/>
+	</scm>
+
+	<properties>
+		<java.version>17</java.version>
+		<!-- VersiÃ³n centralizada del BOM de OpenTelemetry -->
+		<opentelemetry.version>1.43.0</opentelemetry.version>
+	</properties>
+
+	<!-- BOM de OpenTelemetry para gestionar versiones de todos los mÃ³dulos OTel -->
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>io.opentelemetry</groupId>
+				<artifactId>opentelemetry-bom</artifactId>
+				<version>${opentelemetry.version}</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
+
+	<dependencies>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-integration</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-web</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.integration</groupId>
+			<artifactId>spring-integration-http</artifactId>
+		</dependency>
+
+		<!-- ===================== OpenTelemetry / OTLP ===================== -->
+		<!-- API de OpenTelemetry -->
+		<dependency>
+			<groupId>io.opentelemetry</groupId>
+			<artifactId>opentelemetry-api</artifactId>
+		</dependency>
+		<!-- SDK para construir logs, mÃ©tricas y traces -->
+		<dependency>
+			<groupId>io.opentelemetry</groupId>
+			<artifactId>opentelemetry-sdk</artifactId>
+		</dependency>
+		<!-- SDK especÃ­fico para logs (necesario para AIX logs) -->
+		<dependency>
+			<groupId>io.opentelemetry</groupId>
+			<artifactId>opentelemetry-sdk-logs</artifactId>
+		</dependency>
+		<!-- Exporter OTLP para enviar datos a la nube -->
+		<dependency>
+			<groupId>io.opentelemetry</groupId>
+			<artifactId>opentelemetry-exporter-otlp</artifactId>
+		</dependency>
+		<!-- AutoconfiguraciÃ³n del SDK vÃ­a variables de entorno / system properties -->
+		<dependency>
+			<groupId>io.opentelemetry</groupId>
+			<artifactId>opentelemetry-sdk-extension-autoconfigure</artifactId>
+		</dependency>
+		<!-- ================================================================ -->
+
+		<dependency>
+			<groupId>org.projectlombok</groupId>
+			<artifactId>lombok</artifactId>
+			<optional>true</optional>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.integration</groupId>
+			<artifactId>spring-integration-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<!-- ================================================================ -->
+		<!-- Receptor Syslog (UDP/TCP) -->
+		<dependency>
+			<groupId>org.springframework.integration</groupId>
+			<artifactId>spring-integration-syslog</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.integration</groupId>
+			<artifactId>spring-integration-ip</artifactId>
+		</dependency>
+
+		<!-- Lector XML eficiente (Jackson XML) -->
+		<dependency>
+			<groupId>com.fasterxml.jackson.dataformat</groupId>
+			<artifactId>jackson-dataformat-xml</artifactId>
+		</dependency>
+				
+		<!-- ============================================================ -->
+		<!-- SSH client para conexiÃ³n remota a N LPARs AIX                 -->
+		<!-- ============================================================ -->
+		<dependency>
+			<groupId>com.hierynomus</groupId>
+			<artifactId>sshj</artifactId>
+			<version>0.38.0</version>
+		</dependency>
+
+		<!-- BouncyCastle: requerido por sshj para llaves modernas        -->
+		<dependency>
+			<groupId>org.bouncycastle</groupId>
+			<artifactId>bcprov-jdk18on</artifactId>
+			<version>1.78.1</version>
+		</dependency>
+		<dependency>
+			<groupId>org.bouncycastle</groupId>
+			<artifactId>bcpkix-jdk18on</artifactId>
+			<version>1.78.1</version>
+		</dependency>
+		<!-- SSH client para perfil 'ssh' (lparstat real / mock) -->
+		<dependency>
+			<groupId>com.github.mwiede</groupId>
+			<artifactId>jsch</artifactId>
+			<version>0.2.17</version>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.springframework.boot</groupId>
+				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<excludes>
+						<exclude>
+							<groupId>org.projectlombok</groupId>
+							<artifactId>lombok</artifactId>
+						</exclude>
+					</excludes>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>default-compile</id>
+						<phase>compile</phase>
+						<goals>
+							<goal>compile</goal>
+						</goals>
+						<configuration>
+							<annotationProcessorPaths>
+								<path>
+									<groupId>org.projectlombok</groupId>
+									<artifactId>lombok</artifactId>
+								</path>
+							</annotationProcessorPaths>
+						</configuration>
+					</execution>
+					<execution>
+						<id>default-testCompile</id>
+						<phase>test-compile</phase>
+						<goals>
+							<goal>testCompile</goal>
+						</goals>
+						<configuration>
+							<annotationProcessorPaths>
+								<path>
+									<groupId>org.projectlombok</groupId>
+									<artifactId>lombok</artifactId>
+								</path>
+							</annotationProcessorPaths>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+		</plugins>
+	</build>
+
+</project>
