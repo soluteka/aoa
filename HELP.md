@@ -74,3 +74,23 @@ java -jar aoa_logs_agent-0.0.1-SNAPSHOT.jar
 Usa el endpoint correcto por entorno.
 Reintenta automáticamente con backoff si la nube falla.
 Conserva los indicadores en memoria (cola batch) hasta que el OTLP vuelva a estar disponible — sin perder observabilidad.
+
+
+python3 - <<'PY'
+import socket
+
+host = "IP_O_HOSTNAME_HMC"
+port = 12443
+
+s = socket.socket()
+s.settimeout(5)
+
+try:
+    s.connect((host, port))
+    print(f"OK: hay conexión a {host}:{port}")
+except Exception as e:
+    print(f"ERROR: no conecta a {host}:{port}")
+    print(e)
+finally:
+    s.close()
+PY
